@@ -87,7 +87,7 @@ class Exporter(object):
         if not exists('exports'):
             mkdir('exports')
 
-        with open(CONFIG_FILE, 'rb') as cfg:
+        with open(CONFIG_FILE, 'r') as cfg:
             creds = loads(cfg.read())
             self.credentials = (creds['email'], creds['password'])
 
@@ -129,7 +129,7 @@ class Exporter(object):
         else:
             self.stop = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
-    def export(self, start, stop, query="*"):
+    def export(self, start, stop, query):
         """
         Export all Sumologic logs from start to stop.
 
@@ -142,10 +142,7 @@ class Exporter(object):
         # Validate / cleanup the date inputs.
         self.init_dates(start, stop)
 
-        print('Exporting all logs from: %s to %s... This may take a while.\n') % (
-            prettify(self.start),
-            prettify(self.stop),
-        )
+        print('Exporting all logs from: %s to %s... This may take a while.\n' % (prettify(self.start),prettify(self.stop)))
 
         print('Exporting Logs')
         print('--------------')
@@ -172,7 +169,7 @@ class Exporter(object):
                     logs.append(log)
 
                 print(' - Writing log file: exports/%s.json') % prettify(date)
-                with open('exports/%s.json' % prettify(date), 'wb') as exports:
+                with open('exports/%s.json' % prettify(date), 'w') as exports:
                     exports.write(dumps(logs, indent=2, sort_keys=True))
 
                 print(' - Compressing log file: exports/%s.json') % prettify(date)
@@ -218,6 +215,7 @@ class Exporter(object):
 
                 raise
             except:
+                print("sleeping")
                 sleep(1)
 
     def get_count(self, job_url):
@@ -300,8 +298,8 @@ def configure():
     print('To get started, we\'ll need to get your Sumologic credentials.')
 
     while True:
-        email = raw_input('Enter your email: ').strip()
-        password = raw_input('Enter your password: ').strip()
+        email = input('Enter your email: ').strip()
+        password = input('Enter your password: ').strip()
         if not (email or password):
             print('\nYour Sumologic credentials are needed to continue!\n')
             continue
@@ -309,7 +307,7 @@ def configure():
         print('Your API credentials are stored in the file:', CONFIG_FILE, '\n')
         print('Run sumologic-export for usage information.')
 
-        with open(CONFIG_FILE, 'wb') as cfg:
+        with open(CONFIG_FILE, 'w') as cfg:
             cfg.write(dumps({
                 'email': email,
                 'password': password,
@@ -337,7 +335,7 @@ def main(args):
         raise SystemExit()
 
     exporter = Exporter()
-    exporter.export(args['<start>'], args['<stop>'], args['query'])
+    exporter.export(args['<start>'], args['<stop>'], args['<query>'])
 
 
 if __name__ == '__main__':
