@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 """
 sumologic-export
 ~~~~~~~~~~~~~~~~
@@ -14,7 +14,7 @@ Usage:
         [(<stop> | -t <stop> | --stop <stop>)]
         [(<query> | -q <query> | --query <query>)]
         [(<outfile> | -o <outfile> | --outfile <outfile>)]
-        [(<raw> | -r <raw> | --raw <raw>)]
+        [(<raw> | -o <raw> | --raw <raw>)]
     sumologic-export (-h | --help)
     sumologic-export (-v | --version)
 
@@ -111,6 +111,7 @@ class Exporter(object):
             except:
                 print('Invalid date format. Format must be YYYY-MM-DD.')
                 raise SystemExit(1)
+
             if self.start > datetime.now():
                 print('Start date must be in the past!')
                 raise SystemExit(1)
@@ -143,11 +144,11 @@ class Exporter(object):
         # Validate / cleanup the date inputs.
         self.init_dates(start, stop)
 
-        # print('Exporting all logs from: %s to %s... \
-        #     This may take a while.\n') % (
-        #     prettify(self.start),
-        #     prettify(self.stop)
-        # )
+        print('Exporting all logs from: %s to %s... \
+            This may take a while.\n') % (
+            prettify(self.start),
+            prettify(self.stop),
+        )
 
         print('Exporting Logs')
         print('--------------')
@@ -171,7 +172,7 @@ class Exporter(object):
 
             # If there are logs to be downloaded, let's do it.
             if total_logs:
-                print(' - Downloading logs.') % total_logs
+                print(' - Downloading %d logs.') % total_logs
 
                 logs = []
                 for log in self.get_logs(job_url, total_logs):
