@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 sumologic-export
 ~~~~~~~~~~~~~~~~
@@ -6,47 +6,49 @@ sumologic-export
 Export your Sumologic logs easily and quickly.
 
 Usage:
-    sumologic-export configure
+    sumologic-export --configure
     sumologic-export
-    sumologic-export <start> <stop> [<query>] [<outfile>]
-    sumologic-export
-        (<start> | -s <start> | --start <start>)
-        [(<stop> | -t <stop> | --stop <stop>)]
-        [(<query> | -q <query> | --query <query>)]
-        [(<outfile> | -o <outfile> | --outfile <outfile>)]
-        [(<raw> | -r <raw> | --raw <raw>)]
+    sumologic-export <start> <stop> <scope>
     sumologic-export (-h | --help)
     sumologic-export (-v | --version)
 
 Written by Randall Degges (http://www.rdegges.com)
+Updated by Caleb Fogleman (https://github.com/cafogleman)
 """
 
+from __future__ import print_function
 
 from datetime import datetime, timedelta
 from json import dumps, loads
-from os import chmod, mkdir
+from os import chmod, mkdir, walk, remove
 from os.path import exists, expanduser
 from subprocess import call
 from time import sleep
+from queue import Queue
+from threading import Thread
+from gzip import compress
+from argparse import ArgumentParser
 
-from docopt import docopt
 from requests import get, post
 
 
 ##### GLOBALS
-VERSION = '0.1.0'
+VERSION = '0.0.3'
 CONFIG_FILE = expanduser('~/.sumo')
 
 
 # Pretty print datetime objects.
-prettify=lambda x: x.strftime('%Y-%m-%d')
+prettify = lambda x: x.strftime('%Y-%m-%dT%H:%M:%S')
 
 
 class Exporter(object):
     """Abstraction for exporting Sumologic logs."""
 
+    # Partition name to query (or *)
+    SCOPE = '*''*'
+
     # Default time increment to move forward by.
-    INCREMENT = timedelta(days=1)
+    INCREMENT = timedelta(minutes=1440)
 
     # Default timerange to use if no dates are specified.
     DEFAULT_TIMERANGE = timedelta(days=30)
@@ -59,18 +61,25 @@ class Exporter(object):
     }
 
     # Amount of time to wait for API response.
-    TIMEOUT = 10
+    TIMEOUT = 30
 
     # Sumologic timezone to specify.
     TIMEZONE = 'UTC'
 
     # Amount of time to pause before requesting Sumologic logs.  60 seconds
     # seems to be a good amount of time.
-    SLEEP_SECONDS = 60
+    SLEEP_SECONDS = 5
 
     # The amount of logs to download from Sumologic per page.  The higher this
     # is, the more memory is used, but the faster the exports are.
     MESSAGES_PER_PAGE = 10000
+
+    # Number of threads to create
+    THREADS = 10
+    SAVE_THREADS = 5
+
+    # AWS credential profile for uploading to S3
+    PROFILE = 'default'
 
     def __init__(self):
         """
@@ -83,15 +92,15 @@ class Exporter(object):
         - Setting up class variables.
         """
         if not exists(CONFIG_FILE):
-            print('No credentials found! Run sumologic-export configure')
+            print('No credentials found! Run sumologic-export --configure')
             raise SystemExit()
 
         if not exists('exports'):
             mkdir('exports')
 
-        with open(CONFIG_FILE, 'r') as cfg:
+        with open(CONFIG_FILE, 'rb') as cfg:
             creds = loads(cfg.read())
-            self.credentials = (creds['accessid'], creds['accesskey'])
+            self.credentials = (creds['access_id'], creds['access_key'])
 
         self.cookies = None
 
@@ -107,19 +116,35 @@ class Exporter(object):
         """
         if start:
             try:
-                self.start = datetime.strptime(start, '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0)
+                self.start = datetime.strptime(start, '%Y-%m-%d').replace(
+                    hour=0,
+                    minute=0,
+                    second=0,
+                    microsecond=0
+                )
             except:
                 print('Invalid date format. Format must be YYYY-MM-DD.')
                 raise SystemExit(1)
+
             if self.start > datetime.now():
                 print('Start date must be in the past!')
                 raise SystemExit(1)
         else:
-            self.start = (datetime.now() - self.DEFAULT_TIMERANGE).replace(hour=0, minute=0, second=0, microsecond=0)
+            self.start = (datetime.now() - self.DEFAULT_TIMERANGE).replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0
+            )
 
         if stop:
             try:
-                self.stop = datetime.strptime(stop, '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0)
+                self.stop = datetime.strptime(stop, '%Y-%m-%d').replace(
+                    hour=0,
+                    minute=0,
+                    second=0,
+                    microsecond=0
+                )
             except:
                 print('Invalid date format. Format must be YYYY-MM-DD.')
                 raise SystemExit(1)
@@ -128,40 +153,121 @@ class Exporter(object):
                 print('Stop date must be in the past!')
                 raise SystemExit(1)
         else:
-            self.stop = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            self.stop = datetime.now().replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0
+            )
 
-    def export(self, start, stop, query="*", outfile=None, raw=False):
+    def export(self, start, stop, bucket, scope, output):
         """
         Export all Sumologic logs from start to stop.
 
         All logs will be downloaded one day at a time, and put into a local
         folder named 'exports'.
 
+        :param str scope: The Query for results set
         :param str start: The datetime at which to start downloading logs.
         :param str stop: The datetime at which to stop downloading logs.
+        :param str bucket: S3 bucket name for uploading to AWS S3
         """
         # Validate / cleanup the date inputs.
         self.init_dates(start, stop)
 
-        # print('Exporting all logs from: %s to %s... \
-        #     This may take a while.\n') % (
-        #     prettify(self.start),
-        #     prettify(self.stop)
-        # )
+        self.SCOPE = scope
+        self.OUTPUT = output
+
+        print(f'Exporting all logs from: {prettify(self.start)} to '
+              + f'{prettify(self.stop)}... This may take a while.\n')
 
         print('Exporting Logs')
         print('--------------')
 
         date = self.start
-
-        if outfile is None:
-            outfile = prettify(date)
-
+        q = Queue()
+        r = Queue()
         while date < self.stop:
 
+            # Queue up the parts of the job
+            job = (date, date + self.INCREMENT)
+            q.put(job)
+            date += self.INCREMENT
+
+        for i in range(self.THREADS):
+            t = Thread(target=self.threaded_download, args=(q, r))
+            t.daemon = True
+            t.start()
+
+        for j in range(self.SAVE_THREADS):
+            if bucket:
+                h = Thread(target=self.upload_to_s3, args=(r, bucket))
+                h.daemon = True
+                h.start()
+            else:
+                h = Thread(target=self.write_to_file, args=(r,))
+                h.daemon = True
+                h.start()
+
+        q.join()
+        r.join()
+        print('\nFinished downloading logs!')
+
+    def upload_to_s3(self, r, bucket):
+        """
+        Upload gzipped data to AWS S3 bucket.
+
+        :param Queue r: queue of save jobs to be completed
+        :param string bucket: S3 bucket name for uploading to AWS S3
+        """
+
+        from boto3 import Session
+        session = Session(profile_name=self.PROFILE)
+        s3 = session.resource('s3')
+        bucket = s3.Bucket(bucket)
+        while True:
+            if r.empty():
+                sleep(5)
+                continue
+            path, data = r.get()
+            print(f'uploading {path}')
+            bucket.put_object(
+                Key=f'{path}',
+                Body=data
+            )
+            r.task_done()
+
+    def write_to_file(self, r):
+        """
+        Write gzipped data to a local file.
+
+        :param Queue r: queue of save jobs to be completed
+        """
+        while True:
+            if r.empty():
+                sleep(5)
+                continue
+            path, data = r.get()
+            with open(path, 'w') as fout:
+                print(f'writing {path}')
+                for datum in data:
+                    fout.write(datum)
+            r.task_done()
+
+    def threaded_download(self, q, r):
+        """
+        Function for workers to start and retrieve jobs, gzip logs, and queue
+        them for save, whether local or to cloud, asynchronously.
+
+        :param Queue q: queue of download jobs to be run
+        :param Queue r: queue of save jobs to be completed
+        """
+        while not q.empty():
+            job = q.get()
+            date = job[0]
             # Schedule the Sumologic job.
-            job_url = self.create_job(date, date + self.INCREMENT, query)
-            print('-'), prettify(date)
+            job_url = self.create_job(job[0], job[1])
+            print('-', prettify(date))
 
             # Pause to allow Sumologic to process this job.
             sleep(self.SLEEP_SECONDS)
@@ -171,29 +277,26 @@ class Exporter(object):
 
             # If there are logs to be downloaded, let's do it.
             if total_logs:
-                print(' - Downloading logs.') % total_logs
+                print(f' - Downloading {total_logs} logs.')
 
                 logs = []
                 for log in self.get_logs(job_url, total_logs):
-                    if raw:
-                        logs.insert(0,log["_raw"])
-                    else:
-                        logs.insert(0,log)
+                    logs.append(log['_raw'].replace("\n","").replace("\t","")+"\n")
 
-                print(' - Writing log file: exports/%s.log') % outfile
-                with open('exports/%s.log' % outfile, 'w') as exports:
-                    for log_item in logs:
-                        exports.write("%s\n" % log_item)
+                # GZIP logs and queue them for save (local or cloud)
+                r.put(
+                    (
+
+                        f'exports/{self.OUTPUT}-{prettify(date)}.log',
+                        logs
+                    )
+                )
 
             else:
                 print(' - No logs found.')
+            q.task_done()
 
-            # Move forward.
-            date += self.INCREMENT
-
-        print('\nFinished downloading logs!')
-
-    def create_job(self, start, stop, query):
+    def create_job(self, start, stop):
         """
         Request all Sumologic logs for the specified date range.
 
@@ -211,7 +314,9 @@ class Exporter(object):
                     headers=self.SUMOLOGIC_HEADERS,
                     timeout=self.TIMEOUT,
                     data=dumps({
-                        'query': query,
+                        'query': self.SCOPE +
+                                 ' | fields _messagetime, _sourceName,' +
+                                 ' _sourceCategory, _sourceHost, _raw',
                         'from': start.isoformat(),
                         'to': stop.isoformat(),
                         'timeZone': self.TIMEZONE,
@@ -244,11 +349,10 @@ class Exporter(object):
                     auth=self.credentials,
                     headers=self.SUMOLOGIC_HEADERS,
                     timeout=self.TIMEOUT,
-                    cookies=self.cookies,
+                    cookies=self.cookies
                 )
                 if resp.cookies:
                     self.cookies = resp.cookies
-
                 if resp.status_code == 200:
                     json = resp.json()
                     if json['state'] == 'DONE GATHERING RESULTS':
@@ -266,10 +370,10 @@ class Exporter(object):
         :param int count: The number of logs to retrieve.
 
         :rtype: generator
-        :returns: A generator which returns a single JSON log until all logs have
-            been retrieved.
+        :returns: A generator which returns a single JSON log until all logs
+            have been retrieved.
         """
-        for page in xrange(0, (count / self.MESSAGES_PER_PAGE) + 1):
+        for page in range(0, int(count / self.MESSAGES_PER_PAGE) + 1):
             while True:
                 try:
                     resp = get(
@@ -278,14 +382,13 @@ class Exporter(object):
                         headers=self.SUMOLOGIC_HEADERS,
                         timeout=self.TIMEOUT,
                         params={
-                            'limit': self.MESSAGES_PER_PAGE,
-                            'offset': self.MESSAGES_PER_PAGE * page,
+                            'limit': int(self.MESSAGES_PER_PAGE),
+                            'offset': int(self.MESSAGES_PER_PAGE * page),
                         },
                         cookies=self.cookies,
-                    )
+                        )
                     if resp.cookies:
                         self.cookies = resp.cookies
-
                     if resp.status_code == 200:
                         json = resp.json()
                         for log in json['messages']:
@@ -305,22 +408,22 @@ def configure():
     Credentials will be stored in ~/.sumo
     """
     print('Initializing `sumologic-export`...\n')
-    print('To get started, we\'ll need to get your Sumologic credentials.')
+    print("To get started, we'll need to get your Sumologic credentials.")
 
     while True:
-        accessid = input('Enter your accessid: ').strip()
-        accesskey = input('Enter your accesskey: ').strip()
-        if not (accessid or accesskey):
+        access_id = input('Enter your access id: ').strip()
+        access_key = input('Enter your access key: ').strip()
+        if not (access_id or access_key):
             print('\nYour Sumologic credentials are needed to continue!\n')
             continue
 
-        print('Your API credentials are stored in the file:', CONFIG_FILE, '\n')
+        print('Your API credentials are stored in:', CONFIG_FILE, '\n')
         print('Run sumologic-export for usage information.')
 
         with open(CONFIG_FILE, 'w') as cfg:
             cfg.write(dumps({
-                'accessid': accessid,
-                'accesskey': accesskey,
+                'access_id': access_id,
+                'access_key': access_key,
             }, indent=2, sort_keys=True))
 
         # Make the configuration file only accessible to the current user --
@@ -330,23 +433,69 @@ def configure():
         break
 
 
-def main(args):
+def main():
     """
     Handle command line options.
-
-    :param args: Command line arguments.
     """
-    if args['-v']:
+    parser = ArgumentParser(
+        description="Export logs from Sumologic and write to file (or S3)"
+    )
+    parser.add_argument(
+        '--version', '-v',
+        action='store_true',
+        help='Print version and exit'
+    )
+    parser.add_argument(
+        '--configure',
+        action='store_true',
+        help='Configure credentials for use in exporting logs'
+    )
+    parser.add_argument(
+        '--bucket', '-b',
+        default='',
+        type=str,
+        help='Path to S3 bucket for storage'
+    )
+    parser.add_argument(
+        'start',
+        type=str,
+        help='Log start time',
+        nargs='?'
+    )
+    parser.add_argument(
+        'stop',
+        type=str,
+        help='Log stop time',
+        nargs='?'
+    )
+    parser.add_argument(
+        '--scope', '-s',
+        default='*',
+        type=str,
+        help='Query for results set',
+        nargs='?'
+    )
+    parser.add_argument(
+        '--output', '-o',
+        default='output',
+        type=str,
+        help='File name for Output',
+        nargs='?'
+    )
+    args = parser.parse_args()
+
+    if args.version:
         print(VERSION)
         raise SystemExit()
 
-    elif args['configure']:
+    elif args.configure:
         configure()
         raise SystemExit()
 
     exporter = Exporter()
-    exporter.export(args['<start>'], args['<stop>'], args['<query>'], args['<outfile>'], args['<raw>'])
+    exporter.export(args.start, args.stop, bucket=args.bucket, scope=args.scope, output=args.output)
 
 
 if __name__ == '__main__':
-    main(docopt(__doc__, version=VERSION))
+    from sys import exit
+    exit(main())
