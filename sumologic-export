@@ -45,7 +45,7 @@ class Exporter(object):
     """Abstraction for exporting Sumologic logs."""
 
     # Partition name to query (or *)
-    SCOPE = '*''*'
+    SCOPE = '*'
 
     # Default time increment to move forward by.
     INCREMENT = timedelta(minutes=1440)
